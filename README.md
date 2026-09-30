@@ -48,6 +48,21 @@ ROUTER_USER=automation \\
 
 The exact RouterOS command is supplied by the caller, so Fail2ban can use the helper from a custom action without storing a router password locally.
 
+
+Example Fail2ban configuration is included under `fail2ban/action.d/` and `fail2ban/jail.d/`.
+
+A typical installation is:
+
+```bash
+install -m 0750 fail2ban/mikrotik-fail2ban.sh /usr/local/sbin/mikrotik-fail2ban.sh
+cp fail2ban/action.d/mikrotik.conf.example /etc/fail2ban/action.d/mikrotik.conf
+cp fail2ban/jail.d/apache.conf.example /etc/fail2ban/jail.d/apache.conf
+fail2ban-client -t
+systemctl reload fail2ban
+```
+
+The example action adds banned addresses to the RouterOS `threat` address-list with a one-day timeout. Because RouterOS expires the entry itself, `actionunban` is intentionally empty. Adjust the list name and timeout to match your firewall policy.
+
 ## Safe update strategy
 Both scripts use the same update process:
 
