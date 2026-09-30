@@ -51,10 +51,10 @@ The exact RouterOS command is supplied by the caller, so Fail2ban can use the he
 
 Example Fail2ban configuration is included under `fail2ban/examples/`:
 
-- `mikrotik.conf` provides an `action.d` definition that adds banned IPs to a RouterOS `threat` address-list with a one-day timeout.
+- `mikrotik.conf` provides an `action.d` definition that adds banned IPs to a dedicated RouterOS `fail2ban` address-list with a one-day timeout.
 - `apache.conf` shows several Apache/PHP jails using `action = mikrotik`.
 
-The example intentionally leaves `actionunban` empty because RouterOS removes the address-list entry automatically when its timeout expires. Adjust the helper path, address-list name and timeout to match your installation.
+The example intentionally leaves `actionunban` empty because RouterOS removes the address-list entry automatically when its timeout expires. Keep Fail2ban in a dedicated address-list rather than sharing a list managed by a feed synchronization script. Adjust the helper path, address-list name and timeout to match your installation.
 
 
 
