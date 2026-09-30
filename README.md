@@ -72,6 +72,59 @@ systemctl reload fail2ban
 
 The example action adds banned addresses to the RouterOS `threat` address-list with a one-day timeout. Because RouterOS expires the entry itself, `actionunban` is intentionally empty. Adjust the list name and timeout to match your firewall policy.
 
+
+### certificates/letsencrypt-sync.sh
+Renews a Let's Encrypt certificate with Certbot webroot authentication and synchronizes the certificate to MikroTik RouterOS over SSH when the certificate changes.
+
+The workflow is:
+
+1. Test the RouterOS SSH connection.
+2. Temporarily enable a RouterOS NAT rule identified by a configurable comment.
+3. Run Certbot with webroot HTTP-01 validation.
+4. Disable the temporary NAT rule.
+5. Compare the local certificate fingerprint before and after the Certbot run.
+6. If the certificate changed, upload `fullchain.pem` and `privkey.pem`.
+7. Run the RouterOS `CertificateImport` system script.
+8. The RouterOS script imports the certificate/key and removes the temporary uploaded files.
+
+If the certificate did not change, upload/import is skipped. Set `FORCE_IMPORT=1` to upload the existing certificate anyway.
+
+Required configuration:
+
+- `ROUTER_HOST`
+- `DOMAIN`
+- `WEBROOT`
+
+Optional configuration:
+
+- `ROUTER_USER` (default: `automation`)
+- `ROUTER_PORT` (default: `22`)
+- `SSH_IDENTITY`
+- `CERT_DIR` (default: `/etc/letsencrypt/live/$DOMAIN`)
+- `NAT_RULE_COMMENT` (default: `letsencrypt-webroot`)
+- `IMPORT_SCRIPT` (default: `CertificateImport`)
+- `LOCK`
+- `LOG`
+
+Example:
+
+```bash
+ROUTER_HOST=router.example.net \
+DOMAIN=router.example.net \
+WEBROOT=/var/www/router.example.net \
+SSH_IDENTITY=/root/.ssh/mikrotik \
+./certificates/letsencrypt-sync.sh
+```
+
+The public version uses SSH key authentication only.
+
+The `certificates/examples/` directory contains:
+
+- `CertificateImport.rsc` with the RouterOS commands expected by the Linux helper.
+- `nat-rule.rsc` with an example disabled HTTP dst-nat rule identified by the `letsencrypt-webroot` comment.
+
+Review the example NAT rule and adapt its addresses/interfaces before use.
+
 ## Safe update strategy
 Both scripts use the same update process:
 
