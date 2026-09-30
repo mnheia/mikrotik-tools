@@ -25,6 +25,29 @@ Default timeout: `2w1d`
 
 Recommended schedule: once per day or less frequently. Spamhaus asks automated users not to fetch the DROP list more than once per hour.
 
+
+### fail2ban/mikrotik-fail2ban.sh
+Small SSH wrapper intended for Fail2ban actions that need to execute a RouterOS command on a MikroTik device.
+
+The public version uses SSH key authentication only and supports the same common connection variables as the threat-feed scripts:
+
+- `ROUTER_HOST`
+- `ROUTER_USER`
+- `ROUTER_PORT`
+- `SSH_IDENTITY`
+- `LOCK`
+- `LOG`
+
+Example:
+
+```bash
+ROUTER_HOST=router.example.net \\
+ROUTER_USER=automation \\
+./fail2ban/mikrotik-fail2ban.sh '/ip firewall address-list add list=fail2ban address=198.51.100.25 timeout=1d'
+```
+
+The exact RouterOS command is supplied by the caller, so Fail2ban can use the helper from a custom action without storing a router password locally.
+
 ## Safe update strategy
 Both scripts use the same update process:
 
