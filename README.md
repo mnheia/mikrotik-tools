@@ -49,16 +49,9 @@ ROUTER_USER=automation \\
 The exact RouterOS command is supplied by the caller, so Fail2ban can use the helper from a custom action without storing a router password locally.
 
 
-Example Fail2ban configuration is included under `fail2ban/examples/`:
+Example Fail2ban configurations are included under `fail2ban/action.d/` and `fail2ban/jail.d/`. Alternative examples are available under `fail2ban/examples/`.
 
-- `mikrotik.conf` provides an `action.d` definition that adds banned IPs to a dedicated RouterOS `fail2ban` address-list with a one-day timeout.
-- `apache.conf` shows several Apache/PHP jails using `action = mikrotik`.
-
-The example intentionally leaves `actionunban` empty because RouterOS removes the address-list entry automatically when its timeout expires. Keep Fail2ban in a dedicated address-list rather than sharing a list managed by a feed synchronization script. Adjust the helper path, address-list name and timeout to match your installation.
-
-
-
-Example Fail2ban configuration is included under `fail2ban/action.d/` and `fail2ban/jail.d/`.
+Both example actions add banned IPs to the dedicated RouterOS `fail2ban` address-list with a one-day timeout. The `threat` address-list is managed by the Spamhaus DROP synchronization script; do not use it for Fail2ban because feed synchronization removes entries that are absent from the feed.
 
 A typical installation is:
 
@@ -70,8 +63,7 @@ fail2ban-client -t
 systemctl reload fail2ban
 ```
 
-The example action adds banned addresses to the RouterOS `threat` address-list with a one-day timeout. Because RouterOS expires the entry itself, `actionunban` is intentionally empty. Adjust the list name and timeout to match your firewall policy.
-
+The example leaves `actionunban` empty because RouterOS removes entries when their timeout expires. RouterOS `timeout=1d` is independent of Fail2ban's `bantime`; adjust it if a longer ban is required. Review the enabled jails, log paths, helper path, and connection settings before deployment.
 
 ### certificates/letsencrypt-sync.sh
 Renews a Let's Encrypt certificate with Certbot webroot authentication and synchronizes the certificate to MikroTik RouterOS over SSH when the certificate changes.
