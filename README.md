@@ -1,4 +1,4 @@
-Copyright (c) 2026, Mnheia <mnheia@gmail.com>
+Copyright (c) 2026, mnheia
 
 # mikrotik-tools
 Small Linux/Bash utilities for MikroTik RouterOS administration.
