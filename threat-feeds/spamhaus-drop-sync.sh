@@ -1,661 +1,302 @@
 #!/usr/bin/env bash
+# IPv4 threat feed synchronization for MikroTik RouterOS.
+# Copyright (c) 2026, mnheia
+# Fail-closed synchronization; unrelated address-list entries are never changed.
 set -Eeuo pipefail
 
-# Copyright (c) 2026, Mnheia <mnheia@gmail.com>
-#
-# This program is free software; you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation; either version 3 of the License, or
-# (at your option) any later version.
-
-#
-# Spamhaus DROP -> MikroTik RouterOS
-#
-# Downloads the official Spamhaus IPv4 DROP feed,
-# validates all CIDRs on Linux, and synchronizes them
-# into a dynamic MikroTik address-list.
-#
-# Safe update strategy:
-#   1. Download and validate feed locally.
-#   2. Test MikroTik SSH.
-#   3. Add new entries and refresh existing entries in-place.
-#   4. Mark every successfully refreshed entry with a unique generation.
-#   5. Verify that the complete new generation exists.
-#   6. Only then remove stale entries from previous generations.
-#
-# The live address-list is never deleted before the replacement
-# generation has been fully imported and verified.
-#
-# Intended to run once per week.
-#
-
-LOCK_FILE="${LOCK_FILE:-/run/lock/mikrotik-spamhaus-drop-sync.lock}"
-LOG_FILE="${LOG_FILE:-/var/log/mikrotik-spamhaus-drop-sync.log}"
-
-ROUTER_HOST="${ROUTER_HOST:-router.example.com}"
-ROUTER_USER="${ROUTER_USER:-automation}"
-ROUTER_PORT="${ROUTER_PORT:-22}"
+# Generic, public feed synchronizer. Supply router-specific settings via the
+# environment or a local root-readable configuration file OUTSIDE this repository.
+# Do not put passwords, private hostnames or credential files in Git.
+FWL_HOST="${ROUTER_HOST:-}"
+FWL_USER="${ROUTER_USER:-automation}"
+FWL_PORT="${ROUTER_PORT:-22}"
+PASS_FILE="${SSH_PASSWORD_FILE:-}"
 SSH_IDENTITY="${SSH_IDENTITY:-}"
-
 SOURCE_URL="${SOURCE_URL:-https://www.spamhaus.org/drop/drop_v4.json}"
-
 ADDRESS_LIST="${ADDRESS_LIST:-threat}"
-
-#
-# 15 days = 2 weeks + 1 day.
-#
-# Using a timeout makes the entries dynamic.
-# RouterOS stores timeout-based address-list entries in RAM,
-# not permanently on disk.
-#
 TIMEOUT="${TIMEOUT:-2w1d}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+MIN_ENTRIES="${MIN_ENTRIES:-500}"
+MAX_ENTRIES="${MAX_ENTRIES:-5000}"
+OWNER_PREFIX="spamhaus-drop-"
+FEED_NAME="Spamhaus DROP"
+LOG="${LOG_FILE:-/var/log/mikrotik-spamhaus-drop-sync.log}"
+LOCK="${LOCK_FILE:-/run/lock/mikrotik-spamhaus-drop-sync.lock}"
+# Share ROUTER_LOCK across updaters targeting the SAME router.
+ROUTER_LOCK="${ROUTER_LOCK:-/run/lock/mikrotik-feed-router.lock}"
+SSH_EXEC_TIMEOUT="${SSH_EXEC_TIMEOUT:-90}"
+SSH_AUTH_RETRY_DELAY="${SSH_AUTH_RETRY_DELAY:-90}"
+SSH_NETWORK_RETRY_DELAY="${SSH_NETWORK_RETRY_DELAY:-15}"
+BATCH_PAUSE="${BATCH_PAUSE:-2}"
+SSH_MIN_INTERVAL="${SSH_MIN_INTERVAL:-12}"
 
-#
-# Number of RouterOS address-list operations sent in one SSH command.
-# RouterOS SSH does not support feeding multiline commands via stdin,
-# so commands are sent as a single remote command separated by ';'.
-#
-BATCH_SIZE="${BATCH_SIZE:-20}"
+exec >>"$LOG" 2>&1
+printf '\n===== %s starting %s synchronization for %s =====\n' "$(date -Is)" "$FEED_NAME" "$FWL_HOST"
+trap 'status=$?; printf "ERROR: line %s failed with exit code %s: %s\n" "$LINENO" "$status" "$BASH_COMMAND" >&2' ERR
 
-#
-# Sanity limits.
-#
-# Current Spamhaus DROP is normally comfortably within this range.
-#
-MIN_CIDRS="${MIN_CIDRS:-500}"
-MAX_CIDRS="${MAX_CIDRS:-5000}"
-
-
-# ----------------------------------------------------------------------
-# Configuration check
-# ----------------------------------------------------------------------
-
-if [ "$ROUTER_HOST" = "router.example.com" ]; then
-    echo "ERROR: set ROUTER_HOST to your MikroTik hostname or IP address." >&2
+if [[ -z "$FWL_HOST" ]]; then
+    echo "ERROR: ROUTER_HOST must be set in your local environment." >&2
     exit 1
 fi
-
-
-# ----------------------------------------------------------------------
-# Logging
-# ----------------------------------------------------------------------
-
-exec >>"$LOG_FILE" 2>&1
-
-echo
-echo "===== $(date -Is) starting Spamhaus DROP update for ${ROUTER_HOST} ====="
-
-
-# ----------------------------------------------------------------------
-# Lock
-# ----------------------------------------------------------------------
-
-exec 200>"$LOCK_FILE"
-
-flock -n 200 || {
-    echo "Another Spamhaus DROP update is already running. Exiting."
-    exit 0
-}
-
-
-# ----------------------------------------------------------------------
-# Required commands
-# ----------------------------------------------------------------------
-
-need_cmd() {
-    command -v "$1" >/dev/null 2>&1 || {
-        echo "ERROR: required command not found: $1" >&2
-        exit 1
-    }
-}
-
-need_cmd wget
-need_cmd jq
-need_cmd python3
-need_cmd ssh
-need_cmd sort
-need_cmd wc
-need_cmd tr
-need_cmd flock
-need_cmd mktemp
-
-# SSH key authentication only. If SSH_IDENTITY is empty, ssh uses the
-# normal agent/default key selection.
-SSH_OPTS=(
-    -n
-    -o BatchMode=yes
-    -o StrictHostKeyChecking=accept-new
-    -o ConnectTimeout=15
-    -p "$ROUTER_PORT"
-)
-
-if [ -n "$SSH_IDENTITY" ]; then
-    SSH_OPTS+=( -i "$SSH_IDENTITY" )
+if [[ ! "$FWL_HOST" =~ ^[A-Za-z0-9.-]+$ || ! "$FWL_USER" =~ ^[A-Za-z0-9_.-]+$ ||
+      ! "$FWL_PORT" =~ ^[0-9]+$ || ! "$ADDRESS_LIST" =~ ^[A-Za-z0-9_-]+$ ||
+      ! "$TIMEOUT" =~ ^[0-9]+[smhdw]([0-9]+[smhdw])*$ ]]; then
+    echo "ERROR: invalid router, user, port, list or timeout setting." >&2
+    exit 1
 fi
+if [[ -n "$PASS_FILE" && ! -r "$PASS_FILE" ]]; then
+    echo "ERROR: SSH_PASSWORD_FILE cannot be read." >&2
+    exit 1
+fi
+if [[ -z "$PASS_FILE" && -n "$SSH_IDENTITY" && ! -r "$SSH_IDENTITY" ]]; then
+    echo "ERROR: SSH_IDENTITY cannot be read." >&2
+    exit 1
+fi
+for cmd in wget jq python3 sshpass ssh timeout sort wc tr flock mktemp sleep grep cat date; do
+    # jq is only used for Spamhaus.
+    if [[ "$cmd" == jq && "$OWNER_PREFIX" != 'spamhaus-drop-' ]]; then continue; fi
+    if [[ "$cmd" == sshpass && -z "$PASS_FILE" ]]; then continue; fi
+    command -v "$cmd" >/dev/null 2>&1 || { echo "ERROR: missing dependency: $cmd" >&2; exit 1; }
+done
 
-
-# ----------------------------------------------------------------------
-# Temporary working directory
-# ----------------------------------------------------------------------
+exec 200>"$LOCK"
+if ! flock -n 200; then
+    echo "Another instance of this updater is already running; nothing changed."
+    exit 0
+fi
+exec 201>"$ROUTER_LOCK"
+if ! flock -w 120 201; then
+    echo "ERROR: another threat-feed updater is still using this router (120s timeout)." >&2
+    exit 1
+fi
 
 WORKDIR="$(mktemp -d)"
+trap 'rm -rf -- "$WORKDIR"' EXIT
+RAW_FEED="$WORKDIR/downloaded.feed"
+IP_LIST="$WORKDIR/validated-ipv4.txt"
+ROS_SCRIPT="$WORKDIR/routeros-commands.txt"
+SSH_LAST_ATTEMPT_FILE="$WORKDIR/last-ssh-attempt"  # File survives command-substitution subshells.
 
-RAW_LIST="${WORKDIR}/spamhaus-drop.json"
-CIDR_LIST="${WORKDIR}/spamhaus-drop-ipv4.txt"
-ROS_SCRIPT="${WORKDIR}/spamhaus-drop.rsc"
-
-cleanup() {
-    rm -rf "$WORKDIR"
+# Capture errors even under set -e and -o pipefail. This function prints only stdout on success.
+# Never use sshpass -p: the password remains exclusively in the protected local file.
+# Rate limit all SSH logins, not only write batches. Each call runs inside
+# command substitution, so throttle state must live in a file, not a variable.
+ssh_throttle() {
+    local now previous wait
+    now="$(date +%s)"
+    if [[ -r "$SSH_LAST_ATTEMPT_FILE" ]]; then
+        previous="$(cat "$SSH_LAST_ATTEMPT_FILE")"
+        if [[ "$previous" =~ ^[0-9]+$ ]] && (( now >= previous )); then
+            wait=$(( SSH_MIN_INTERVAL - (now - previous) ))
+            if (( wait > 0 )); then sleep "$wait"; fi
+        fi
+    fi
+    date +%s > "$SSH_LAST_ATTEMPT_FILE"
 }
 
-trap cleanup EXIT
+ssh_exec() {
+    local remote="$1" output status attempt delay
+    local -a ssh_command=(ssh -n -T)
+    if [[ -n "$PASS_FILE" ]]; then
+        # Password stays in a private local file, never on the command line.
+        ssh_command=(sshpass -f "$PASS_FILE" ssh -n -T
+            -o PubkeyAuthentication=no
+            -o PreferredAuthentications=password,keyboard-interactive
+            -o NumberOfPasswordPrompts=1)
+    else
+        ssh_command+=( -o BatchMode=yes -o PreferredAuthentications=publickey )
+        if [[ -n "$SSH_IDENTITY" ]]; then
+            ssh_command+=( -o IdentitiesOnly=yes -i "$SSH_IDENTITY" )
+        fi
+    fi
+    for attempt in 1 2; do
+        ssh_throttle
+        if output="$(
+            timeout -k 5s "$SSH_EXEC_TIMEOUT" \
+            "${ssh_command[@]}" \
+              -o StrictHostKeyChecking=accept-new \
+              -o ConnectTimeout=15 \
+              -o ServerAliveInterval=15 \
+              -o ServerAliveCountMax=4 \
+              -p "$FWL_PORT" \
+              "${FWL_USER}@${FWL_HOST}" "$remote" 2>&1
+        )"; then
+            printf '%s\n' "$output"
+            return 0
+        else
+            status=$?
+        fi
+        printf 'WARNING: MikroTik SSH attempt %s failed (exit %s; timeout exit is 124).\n' \
+          "$attempt" "$status" >&2
+        printf '%s\n' "$output" >&2
+        # Host-key mismatch and bad password-file errors are not transient.
+        if [[ "$output" == *'REMOTE HOST IDENTIFICATION HAS CHANGED'* ]] ||
+           [[ "$output" == *'Host key verification failed'* ]] ||
+           [[ "$status" -eq 5 ]]; then
+            echo 'ERROR: SSH authentication/host verification requires manual attention.' >&2
+            return 1
+        fi
+        if (( attempt == 2 )); then
+            echo 'ERROR: MikroTik SSH failed again after one delayed retry.' >&2
+            return 1
+        fi
+        if [[ "$output" == *'Permission denied'* ]]; then
+            delay="$SSH_AUTH_RETRY_DELAY"
+        elif (( status == 124 || status == 255 )); then
+            delay="$SSH_NETWORK_RETRY_DELAY"
+        else
+            echo 'ERROR: Non-transient SSH failure; not retrying.' >&2
+            return 1
+        fi
+        printf 'WARNING: Cooling down %s seconds before ONE retry.\n' "$delay" >&2
+        sleep "$delay"
+    done
+    return 1
+}
 
+remote_count() {
+    local value
+    if ! value="$(ssh_exec "$1")"; then return 1; fi
+    value="$(printf '%s' "$value" | tr -d '\r[:space:]')"
+    if [[ ! "$value" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: invalid RouterOS count response: $value" >&2
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
 
-# ----------------------------------------------------------------------
-# Download Spamhaus DROP
-# ----------------------------------------------------------------------
-
-echo "Downloading Spamhaus DROP:"
-echo "  ${SOURCE_URL}"
-
-wget \
-    -q \
-    -T 30 \
-    --tries=3 \
-    -O "$RAW_LIST" \
-    "$SOURCE_URL"
-
-
-if [ ! -s "$RAW_LIST" ]; then
-    echo "ERROR: downloaded Spamhaus DROP file is empty." >&2
-    exit 1
+# Download and fully validate BEFORE writing any router entries.
+echo "Downloading $FEED_NAME feed: $SOURCE_URL"
+if ! wget -q -T 30 --tries=3 -O "$RAW_FEED" "$SOURCE_URL"; then
+    echo "ERROR: download failed; MikroTik unchanged." >&2; exit 1
 fi
+if [[ ! -s "$RAW_FEED" ]]; then echo "ERROR: empty feed; MikroTik unchanged." >&2; exit 1; fi
+echo "Download size: $(wc -c < "$RAW_FEED") bytes"
 
-
-DOWNLOAD_SIZE="$(wc -c < "$RAW_LIST" | tr -d ' ')"
-
-echo "Download completed."
-echo "Downloaded size: ${DOWNLOAD_SIZE} bytes"
-
-
-# ----------------------------------------------------------------------
-# Validate JSON stream
-# ----------------------------------------------------------------------
-
-echo "Validating Spamhaus JSON feed"
-
-if ! jq empty "$RAW_LIST" >/dev/null 2>&1; then
-    echo "ERROR: downloaded Spamhaus file contains invalid JSON." >&2
-    exit 1
-fi
-
-
-# ----------------------------------------------------------------------
-# Extract DROP CIDRs
-#
-# Spamhaus publishes actual DROP entries with:
-#
-#   .type == null
-#   .cidr
-#
-# Metadata objects are ignored.
-# ----------------------------------------------------------------------
-
-echo "Extracting IPv4 DROP CIDRs"
-
-jq -r '
-    select(.type == null)
-    | select(.cidr != null)
-    | .cidr
-' "$RAW_LIST" \
-    | sort -u \
-    > "$CIDR_LIST"
-
-
-if [ ! -s "$CIDR_LIST" ]; then
-    echo "ERROR: no IPv4 CIDRs extracted from Spamhaus feed." >&2
-    exit 1
-fi
-
-
-# ----------------------------------------------------------------------
-# Strict IPv4 CIDR validation
-# ----------------------------------------------------------------------
-
-echo "Validating IPv4 CIDRs"
-
-python3 - "$CIDR_LIST" <<'PY'
+jq -r 'select(type == "object" and .type == null and .cidr != null) | .cidr' "$RAW_FEED" \
+    | sort -u > "$IP_LIST"
+python3 - "$IP_LIST" <<'PYDROP'
 import ipaddress
 import sys
-
-filename = sys.argv[1]
 count = 0
-
-with open(filename, "r", encoding="utf-8") as f:
-    for line_number, line in enumerate(f, 1):
+with open(sys.argv[1], encoding="utf-8") as fd:
+    for line_num, line in enumerate(fd, 1):
         cidr = line.strip()
-
         if not cidr:
             continue
-
         try:
-            network = ipaddress.ip_network(cidr, strict=True)
+            ip = ipaddress.ip_network(cidr, strict=True)
         except ValueError as exc:
-            print(
-                f"ERROR: invalid CIDR on line {line_number}: "
-                f"{cidr}: {exc}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
-        if network.version != 4:
-            print(
-                f"ERROR: non-IPv4 network on line "
-                f"{line_number}: {cidr}",
-                file=sys.stderr,
-            )
-            sys.exit(1)
-
+            sys.exit(f"Invalid Spamhaus DROP CIDR at line {line_num}: {exc}")
+        if ip.version != 4 or not ip.is_global:
+            sys.exit(f"Non-global or non-IPv4 Spamhaus CIDR at line {line_num}: {cidr}")
         count += 1
-
 if count == 0:
-    print("ERROR: no valid IPv4 networks found.", file=sys.stderr)
-    sys.exit(1)
+    sys.exit("Spamhaus DROP feed contains no valid IPv4 CIDRs")
+print(f"Validated Spamhaus DROP IPv4 CIDRs: {count}")
+PYDROP
 
-print(f"Validated IPv4 CIDRs: {count}")
-PY
-
-
-# ----------------------------------------------------------------------
-# Count / sanity check
-# ----------------------------------------------------------------------
-
-TOTAL_COUNT="$(wc -l < "$CIDR_LIST" | tr -d ' ')"
-
-echo "Spamhaus IPv4 DROP CIDRs found: ${TOTAL_COUNT}"
-
-
-if [ "$TOTAL_COUNT" -lt "$MIN_CIDRS" ]; then
-    echo
-    echo "ERROR: suspiciously small Spamhaus DROP list."
-    echo "Minimum expected: ${MIN_CIDRS}"
-    echo "Received:         ${TOTAL_COUNT}"
-    echo
-    echo "MikroTik has NOT been modified."
+TOTAL_COUNT="$(wc -l < "$IP_LIST" | tr -d ' ')"
+if (( TOTAL_COUNT < MIN_ENTRIES || TOTAL_COUNT > MAX_ENTRIES )); then
+    echo "ERROR: unexpected $FEED_NAME entry count: $TOTAL_COUNT (allowed $MIN_ENTRIES..$MAX_ENTRIES); router unchanged." >&2
     exit 1
 fi
+GENERATION="${OWNER_PREFIX}$(date -u +%Y%m%dT%H%M%SZ)-$$"
+echo "Validated IPv4 entries: $TOTAL_COUNT; generation: $GENERATION"
 
-
-if [ "$TOTAL_COUNT" -gt "$MAX_CIDRS" ]; then
-    echo
-    echo "ERROR: suspiciously large Spamhaus DROP list."
-    echo "Maximum expected: ${MAX_CIDRS}"
-    echo "Received:         ${TOTAL_COUNT}"
-    echo
-    echo "MikroTik has NOT been modified."
-    exit 1
+# Each request reports an individual success marker. A connection success or final
+# marker alone is NOT proof that RouterOS actually applied each command.
+# Foreign entries in shared lists (including Fail2Ban's 'threat') must never be
+# overwritten or deleted. Any exact-address collision aborts stale cleanup.
+echo "Building RouterOS requests"
+while IFS= read -r addr; do
+    [[ -n "$addr" ]] || continue
+    printf ':do { :local ids [/ip firewall address-list find where list="%s" and address="%s"]; :if ([:len $ids] = 0) do={ /ip firewall address-list add list="%s" address="%s" timeout=%s comment="%s" } else={ :foreach id in=$ids do={ :local c [:tostr [/ip firewall address-list get $id comment]]; :if ([:pick $c 0 %s] = "%s") do={ /ip firewall address-list set $id timeout=%s comment="%s" } else={ :put "SYNC_CONFLICT:%s"; :error "foreign entry" } } }; :put "SYNC_OK:%s" } on-error={ :put "SYNC_FAIL:%s" }\n' \
+        "$ADDRESS_LIST" "$addr" "$ADDRESS_LIST" "$addr" "$TIMEOUT" "$GENERATION" \
+        "${#OWNER_PREFIX}" "$OWNER_PREFIX" "$TIMEOUT" "$GENERATION" "$addr" "$addr" "$addr"
+done < "$IP_LIST" > "$ROS_SCRIPT"
+if [[ "$(wc -l < "$ROS_SCRIPT" | tr -d ' ')" -ne "$TOTAL_COUNT" ]]; then
+    echo "ERROR: generated command count mismatch; router unchanged." >&2; exit 1
 fi
 
-
-# ----------------------------------------------------------------------
-# Generation marker
-#
-# Every entry successfully processed during this run receives the same
-# comment. Stale entries retain an older/blank comment and are removed
-# only after the new generation has been fully verified.
-# ----------------------------------------------------------------------
-
-GENERATION="spamhaus-drop-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-
-echo "Generation: ${GENERATION}"
-
-
-# ----------------------------------------------------------------------
-# Build RouterOS command list
-#
-# RouterOS does not allow duplicate addresses in the same address-list.
-# Therefore each command tries ADD first. If the address already exists,
-# the on-error handler refreshes that existing entry's timeout and comment.
-#
-# Every line is later joined into a small semicolon-separated SSH batch.
-# No multiline script is sent through SSH stdin.
-# ----------------------------------------------------------------------
-
-echo
-echo "Building RouterOS command list"
-
-while IFS= read -r cidr; do
-
-    [ -z "$cidr" ] && continue
-
-    printf ':do { /ip firewall address-list add list="%s" address="%s" timeout=%s comment="%s" } on-error={ /ip firewall address-list set [find where list="%s" and address="%s"] timeout=%s comment="%s" }\n' \
-        "$ADDRESS_LIST" \
-        "$cidr" \
-        "$TIMEOUT" \
-        "$GENERATION" \
-        "$ADDRESS_LIST" \
-        "$cidr" \
-        "$TIMEOUT" \
-        "$GENERATION"
-
-done < "$CIDR_LIST" > "$ROS_SCRIPT"
-
-
-SCRIPT_COUNT="$(wc -l < "$ROS_SCRIPT" | tr -d ' ')"
-
-echo "RouterOS commands generated: ${SCRIPT_COUNT}"
-
-
-if [ "$SCRIPT_COUNT" -ne "$TOTAL_COUNT" ]; then
-    echo "ERROR: RouterOS command count does not match CIDR count." >&2
-    exit 1
+echo "Testing MikroTik SSH connection to $FWL_HOST"
+if ! SSH_TEST="$(ssh_exec ':put "sync-ssh-test-ok"')"; then
+    echo "ERROR: SSH preflight failed; no router changes were attempted." >&2; exit 1
 fi
-
-
-# ----------------------------------------------------------------------
-# Test MikroTik SSH BEFORE modifying anything
-# ----------------------------------------------------------------------
-
-echo
-echo "Testing SSH connection to ${ROUTER_HOST}"
-
-SSH_TEST="$(
-    ssh "${SSH_OPTS[@]}" \
-        "${ROUTER_USER}@${ROUTER_HOST}" \
-        ':put "spamhaus-test-ok"' \
-        2>&1
-)"
-
-
-if [[ "$SSH_TEST" != *"spamhaus-test-ok"* ]]; then
-    echo "ERROR: MikroTik SSH test failed." >&2
-    echo "$SSH_TEST"
-    exit 1
+if [[ "$(printf '%s' "$SSH_TEST" | tr -d '\r[:space:]')" != "sync-ssh-test-ok" ]]; then
+    echo "ERROR: unexpected SSH test response: $SSH_TEST" >&2; exit 1
 fi
+echo "SSH preflight OK"
 
+BEFORE="$(remote_count "/ip firewall address-list print count-only where list=\"${ADDRESS_LIST}\"")" || exit 1
+echo "Existing $ADDRESS_LIST entries (all owners): $BEFORE"
 
-echo "MikroTik SSH connection OK"
-
-
-# ----------------------------------------------------------------------
-# Check existing list count
-# ----------------------------------------------------------------------
-
-echo
-echo "Checking current MikroTik list"
-
-REMOTE_BEFORE="$(
-    ssh "${SSH_OPTS[@]}" \
-        "${ROUTER_USER}@${ROUTER_HOST}" \
-        "/ip firewall address-list print count-only where list=\"${ADDRESS_LIST}\"" \
-        | tr -d '\r[:space:]'
-)"
-
-
-if [[ ! "$REMOTE_BEFORE" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: invalid current MikroTik address-list count:"
-    echo "$REMOTE_BEFORE"
-    exit 1
-fi
-
-
-echo "Existing ${ADDRESS_LIST} entries: ${REMOTE_BEFORE}"
-
-
-# ----------------------------------------------------------------------
-# Execute RouterOS commands in small SSH batches
-#
-# IMPORTANT:
-#
-# We do NOT delete the existing list first.
-#
-# Existing CIDRs are refreshed in place.
-# New CIDRs are added.
-# Old/stale CIDRs remain active until the new generation is verified.
-# ----------------------------------------------------------------------
-
-echo
-echo "Synchronizing ${TOTAL_COUNT} Spamhaus CIDRs"
-echo "SSH batch size: ${BATCH_SIZE}"
-
-BATCH=""
-BATCH_COMMANDS=0
 BATCH_NUMBER=0
 PROCESSED=0
-
-
-run_routeros_batch() {
-
-    local commands="$1"
-    local command_count="$2"
-    local marker
-    local output
-    local rc
-
+run_batch() {
+    local commands="" line output ok_count expected=$#
     BATCH_NUMBER=$((BATCH_NUMBER + 1))
-
-    marker="spamhaus-batch-${BATCH_NUMBER}-ok"
-
-    set +e
-
-    output="$(
-        ssh "${SSH_OPTS[@]}" \
-            -o ServerAliveInterval=15 \
-            -o ServerAliveCountMax=4 \
-            "${ROUTER_USER}@${ROUTER_HOST}" \
-            "${commands}; :put \"${marker}\"" \
-            2>&1
-    )"
-
-    rc=$?
-
-    set -e
-
-
-    if [ "$rc" -ne 0 ]; then
-        echo
-        echo "ERROR: SSH batch ${BATCH_NUMBER} failed."
-        echo "SSH exit code: ${rc}"
-        echo "$output"
-        echo
-        echo "Old MikroTik entries have NOT been removed."
+    for line in "$@"; do
+        if [[ -z "$commands" ]]; then commands="$line"; else commands+="; $line"; fi
+    done
+    if ! output="$(ssh_exec "$commands")"; then
+        echo "ERROR: batch $BATCH_NUMBER SSH failed; no stale entries have been removed." >&2
         exit 1
     fi
-
-
-    if [[ "$output" != *"$marker"* ]]; then
-        echo
-        echo "ERROR: RouterOS batch ${BATCH_NUMBER} did not complete."
-        echo "$output"
-        echo
-        echo "Old MikroTik entries have NOT been removed."
+    output="${output//$'\r'/}"
+    ok_count="$(printf '%s\n' "$output" | grep -c '^SYNC_OK:' || true)"
+    if [[ "$ok_count" -ne "$expected" || "$output" == *"SYNC_FAIL:"* || "$output" == *"SYNC_CONFLICT:"* ]]; then
+        echo "ERROR: batch $BATCH_NUMBER incomplete: $ok_count/$expected confirmed operations." >&2
+        printf '%s\n' "$output" >&2
+        echo "Previously installed entries have NOT been cleaned up." >&2
         exit 1
     fi
-
-
-    PROCESSED=$((PROCESSED + command_count))
-
-    echo "Batch ${BATCH_NUMBER}: ${PROCESSED}/${TOTAL_COUNT} CIDRs processed"
+    PROCESSED=$((PROCESSED + expected))
+    echo "Batch $BATCH_NUMBER: $PROCESSED/$TOTAL_COUNT confirmed"
+    sleep "$BATCH_PAUSE"
 }
 
-
-while IFS= read -r command; do
-
-    [ -z "$command" ] && continue
-
-    if [ -z "$BATCH" ]; then
-        BATCH="$command"
-    else
-        BATCH="${BATCH}; ${command}"
+echo "Applying $TOTAL_COUNT addresses; batch size=$BATCH_SIZE"
+declare -a batch=()
+while IFS= read -r command || [[ -n "$command" ]]; do
+    [[ -n "$command" ]] || continue
+    batch+=("$command")
+    if (( ${#batch[@]} >= BATCH_SIZE )); then
+        run_batch "${batch[@]}"
+        batch=()
     fi
-
-    BATCH_COMMANDS=$((BATCH_COMMANDS + 1))
-
-
-    if [ "$BATCH_COMMANDS" -ge "$BATCH_SIZE" ]; then
-
-        run_routeros_batch "$BATCH" "$BATCH_COMMANDS"
-
-        BATCH=""
-        BATCH_COMMANDS=0
-    fi
-
 done < "$ROS_SCRIPT"
+if (( ${#batch[@]} > 0 )); then run_batch "${batch[@]}"; fi
 
-
-# Send final partial batch.
-if [ "$BATCH_COMMANDS" -gt 0 ]; then
-    run_routeros_batch "$BATCH" "$BATCH_COMMANDS"
-fi
-
-
-echo
-echo "All RouterOS update batches completed"
-
-
-# ----------------------------------------------------------------------
-# Verify new generation BEFORE deleting stale entries
-# ----------------------------------------------------------------------
-
-echo
-echo "Verifying new Spamhaus generation"
-
-REMOTE_CURRENT="$(
-    ssh "${SSH_OPTS[@]}" \
-        "${ROUTER_USER}@${ROUTER_HOST}" \
-        "/ip firewall address-list print count-only where list=\"${ADDRESS_LIST}\" and comment=\"${GENERATION}\"" \
-        | tr -d '\r[:space:]'
-)"
-
-
-if [[ ! "$REMOTE_CURRENT" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: invalid MikroTik generation count:"
-    echo "$REMOTE_CURRENT"
-    echo
-    echo "Stale address-list entries have NOT been removed."
+# Verify only entries owned by THIS synchronization, never raw list size.
+COUNT_QUERY="/ip firewall address-list print count-only where list=\"${ADDRESS_LIST}\" and comment=\"${GENERATION}\""
+NEW_COUNT="$(remote_count "$COUNT_QUERY")" || exit 1
+echo "Verified generation entries: $NEW_COUNT/$TOTAL_COUNT"
+if (( NEW_COUNT != TOTAL_COUNT )); then
+    echo "ERROR: incomplete generation; stale entries retained, no cleanup." >&2
     exit 1
 fi
 
+# Cleanup is scoped by our exact ownership prefix, not merely list name. Never
+# delete Fail2Ban bans, manually managed addresses, or other feed entries.
+CLEANUP_CMD=":do { /ip firewall address-list remove [/ip firewall address-list find where list=\"${ADDRESS_LIST}\" and comment~\"^${OWNER_PREFIX}\" and comment!=\"${GENERATION}\"]; :put \"SYNC_CLEANUP_OK\" } on-error={ :put \"SYNC_CLEANUP_FAIL\" }"
+if ! CLEANUP_OUT="$(ssh_exec "$CLEANUP_CMD")"; then
+    echo "ERROR: stale-entry cleanup SSH failed; current generation remains active." >&2; exit 1
+fi
+if [[ "$(printf '%s' "$CLEANUP_OUT" | tr -d '\r[:space:]')" != "SYNC_CLEANUP_OK" ]]; then
+    echo "ERROR: cleanup not acknowledged: $CLEANUP_OUT" >&2; exit 1
+fi
 
-echo "Spamhaus feed CIDRs:        ${TOTAL_COUNT}"
-echo "Current generation entries: ${REMOTE_CURRENT}"
-
-
-if [ "$REMOTE_CURRENT" -ne "$TOTAL_COUNT" ]; then
-    echo
-    echo "ERROR: new Spamhaus generation is incomplete."
-    echo
-    echo "Feed:       ${TOTAL_COUNT}"
-    echo "Generation: ${REMOTE_CURRENT}"
-    echo
-    echo "Stale address-list entries have NOT been removed."
-    echo "Existing firewall protection remains in place."
+FINAL_COUNT="$(remote_count "$COUNT_QUERY")" || exit 1
+STALE_QUERY="/ip firewall address-list print count-only where list=\"${ADDRESS_LIST}\" and comment~\"^${OWNER_PREFIX}\" and comment!=\"${GENERATION}\""
+STALE_COUNT="$(remote_count "$STALE_QUERY")" || exit 1
+if (( FINAL_COUNT != TOTAL_COUNT || STALE_COUNT != 0 )); then
+    echo "ERROR: final verification failed (current=$FINAL_COUNT expected=$TOTAL_COUNT stale=$STALE_COUNT)." >&2
     exit 1
 fi
 
-
-echo "New generation verified successfully"
-
-
-# ----------------------------------------------------------------------
-# Remove stale entries
-#
-# THIS IS THE ONLY POINT where old entries are removed.
-#
-# At this point every current Spamhaus CIDR has already been imported or
-# refreshed and marked with the current generation.
-# ----------------------------------------------------------------------
-
-echo
-echo "Removing stale Spamhaus entries"
-
-CLEANUP_MARKER="spamhaus-cleanup-ok"
-
-set +e
-
-CLEANUP_OUTPUT="$(
-    ssh "${SSH_OPTS[@]}" \
-        "${ROUTER_USER}@${ROUTER_HOST}" \
-        "/ip firewall address-list remove [find where list=\"${ADDRESS_LIST}\" and comment!=\"${GENERATION}\"]; :put \"${CLEANUP_MARKER}\"" \
-        2>&1
-)"
-
-CLEANUP_RC=$?
-
-set -e
-
-
-if [ "$CLEANUP_RC" -ne 0 ]; then
-    echo "ERROR: stale-entry cleanup failed."
-    echo "$CLEANUP_OUTPUT"
-    echo
-    echo "The new generation remains installed."
-    echo "Some stale entries may also remain."
-    exit 1
-fi
-
-
-if [[ "$CLEANUP_OUTPUT" != *"$CLEANUP_MARKER"* ]]; then
-    echo "ERROR: stale-entry cleanup did not complete."
-    echo "$CLEANUP_OUTPUT"
-    echo
-    echo "The new generation remains installed."
-    echo "Some stale entries may also remain."
-    exit 1
-fi
-
-
-echo "Stale entries removed successfully"
-
-
-# ----------------------------------------------------------------------
-# Final remote verification
-# ----------------------------------------------------------------------
-
-echo
-echo "Checking final ${ADDRESS_LIST} address-list count"
-
-REMOTE_AFTER="$(
-    ssh "${SSH_OPTS[@]}" \
-        "${ROUTER_USER}@${ROUTER_HOST}" \
-        "/ip firewall address-list print count-only where list=\"${ADDRESS_LIST}\"" \
-        | tr -d '\r[:space:]'
-)"
-
-
-if [[ ! "$REMOTE_AFTER" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: invalid final MikroTik address-list count:"
-    echo "$REMOTE_AFTER"
-    exit 1
-fi
-
-
-echo "Spamhaus feed CIDRs:   ${TOTAL_COUNT}"
-echo "MikroTik list entries: ${REMOTE_AFTER}"
-
-
-if [ "$REMOTE_AFTER" -ne "$TOTAL_COUNT" ]; then
-    echo
-    echo "ERROR: final MikroTik address-list count does not match Spamhaus feed."
-    echo
-    echo "Feed:     ${TOTAL_COUNT}"
-    echo "MikroTik: ${REMOTE_AFTER}"
-    exit 1
-fi
-
-
-# ----------------------------------------------------------------------
-# Success
-# ----------------------------------------------------------------------
-
-echo
-echo "Spamhaus DROP synchronization completed successfully"
-echo
-echo "Source:       ${SOURCE_URL}"
-echo "Address list: ${ADDRESS_LIST}"
-echo "CIDRs:        ${TOTAL_COUNT}"
-echo "Timeout:      ${TIMEOUT}"
-echo "Generation:   ${GENERATION}"
-echo "SSH batches:  ${BATCH_NUMBER}"
-echo
-echo "===== $(date -Is) finished Spamhaus DROP update for ${ROUTER_HOST} ====="
+echo "$FEED_NAME synchronization completed successfully"
+echo "Source: $SOURCE_URL"
+echo "Address list: $ADDRESS_LIST; entries: $FINAL_COUNT; timeout: $TIMEOUT"
+echo "Generation: $GENERATION; SSH batches: $BATCH_NUMBER"
+printf '===== %s finished %s synchronization for %s =====\n' "$(date -Is)" "$FEED_NAME" "$FWL_HOST"
