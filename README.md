@@ -51,7 +51,7 @@ The exact RouterOS command is supplied by the caller, so Fail2ban can use the he
 
 Example Fail2ban configurations are included under `fail2ban/action.d/` and `fail2ban/jail.d/`. Alternative examples are available under `fail2ban/examples/`.
 
-Both example actions add banned IPs to the dedicated RouterOS `fail2ban` address-list with a one-day timeout. The `threat` address-list is managed by the Spamhaus DROP synchronization script; do not use it for Fail2ban because feed synchronization removes entries that are absent from the feed.
+Both example actions add banned IPs to a dedicated RouterOS `fail2ban` address-list with a one-day timeout. A separate list is preferable, but the feed synchronizers now operate safely on shared lists: they only update their own generation-tagged records, stop on foreign address collisions, and remove only stale entries carrying their own ownership prefix.
 
 A typical installation is:
 
@@ -117,18 +117,45 @@ The `certificates/examples/` directory contains:
 
 Review the example NAT rule and adapt its addresses/interfaces before use.
 
+
+### Connection settings and rate limits for threat feeds
+
+`threat-feeds/c2intel-sync.sh` and `threat-feeds/spamhaus-drop-sync.sh` now include the tested safeguards for SSH errors, per-operation acknowledgement, conservative SSH rate limiting, and ownership-scoped cleanup. These two generic scripts cover any number of routers (for example, two scripts installed on each of two servers).
+
+Configure locally; **never commit your actual values, password file, or environment file**:
+
+```bash
+# Example only: put your real details in a separate private file, not Git.
+export ROUTER_HOST=router.example.net
+export ROUTER_USER=automation
+export ROUTER_PORT=22
+export SSH_PASSWORD_FILE=/etc/router-credentials/automation.pass
+export BATCH_SIZE=8
+export SSH_MIN_INTERVAL=12
+export ROUTER_LOCK=/run/lock/mikrotik-feed-router.lock
+./threat-feeds/spamhaus-drop-sync.sh
+```
+
+Without `SSH_PASSWORD_FILE`, the scripts use key authentication; optional `SSH_IDENTITY` selects a private key. Password files should be accessible only to the automation account/root (for example mode `0600`). This is local configuration only.
+
+Both feed scripts accept `ROUTER_HOST`, `ROUTER_USER`, `ROUTER_PORT`, `SSH_IDENTITY`, `SSH_PASSWORD_FILE`, `LOG_FILE`, `LOCK_FILE`, `ROUTER_LOCK`, `BATCH_SIZE`, `BATCH_PAUSE`, `SSH_MIN_INTERVAL`, `SSH_AUTH_RETRY_DELAY`, `SSH_NETWORK_RETRY_DELAY` and `SSH_EXEC_TIMEOUT`. Supply the same `ROUTER_LOCK` for both feed jobs on the same router. The default SSH minimum interval is conservative (12 seconds); increase batch size or reduce the interval only when the router can handle it.
+
+The feed lists default to `botnet` (C2IntelFeeds, `8d`) and `threat` (Spamhaus, `2w1d`). Only entries marked `c2intel-*` or `spamhaus-drop-*`, respectively, are eligible for stale cleanup. If the feed overlaps an IP already owned by another system, synchronization stops without deleting the other entry.
+
+A full synchronization has not been verified against every RouterOS version. Test with an existing backup before enabling a scheduled job.
+
 ## Safe update strategy
-Both scripts use the same update process:
+Both feed scripts use the same update process, on any router:
 
 1. Download and validate the feed locally.
 2. Test the SSH connection to RouterOS.
-3. Add new entries and refresh existing entries in batches.
+3. Throttle SSH sessions and retry one transient connection failure, then add or refresh only records already owned by this feed.
 4. Mark successfully processed entries with a unique generation.
 5. Verify that the complete new generation exists.
-6. Only then remove stale entries from the previous generation.
+6. Only then remove stale records with this feed's ownership prefix; preserve other entries (including Fail2Ban bans).
 7. Verify the final address-list count.
 
-The live address-list is therefore not cleared before a replacement feed has been imported and verified.
+The live address-list is never cleared before a replacement feed has been imported and verified. Ownership conflicts fail closed rather than deleting or overwriting unrelated records.
 
 ## Requirements
 Linux with:
@@ -138,14 +165,15 @@ Linux with:
 - wget
 - Python 3
 - flock
-- standard core utilities
+- timeout and standard core utilities
+- optional `sshpass` when using `SSH_PASSWORD_FILE`
 
 `spamhaus-drop-sync.sh` also requires `jq`.
 
 The RouterOS user must have enough permissions to read and modify `/ip firewall address-list` entries.
 
 ## SSH authentication
-The public versions use SSH key authentication only. Password files and `sshpass` are not used.
+The scripts support SSH key authentication by default. Alternatively, set `SSH_PASSWORD_FILE` to the path of an existing, locally protected password file; that mode uses `sshpass -f`. No passwords, hostnames or authentication files need to be stored in Git, and the examples do not contain real credentials.
 
 Configure RouterOS SSH access first, then run for example:
 
